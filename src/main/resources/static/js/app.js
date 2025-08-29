@@ -8,25 +8,26 @@ const $ = (sel) => document.querySelector(sel);
 // CSRF
 const csrfToken = document.querySelector("meta[name='_csrf']")?.content;
 const csrfHeader = document.querySelector("meta[name='_csrf_header']")?.content;
-const DEFAULT_AVATAR_URL = '/images/defaultAvt.jpg';
-const avatarCache = new Map(); // username => url
 
-const editMailInput  = $("#editMail");
-const editPhoneInput = $("#editPhone");
-let   currentProfile = null; // nhớ profile mới nhất lấy từ server
 // Main elements
 const usernamePage = $('#username-page');
 const chatPage = $('#chat-page');
 const messageInput = $("#messageInput");
 const sendButton = $("#sendButton");
 const chatMessages = $("#chatMessages");
-
+// lưu ảnh và vi déo
+const attachBtn = document.getElementById("attachBtn");
+const attachInput = document.getElementById("attachInput");
+const attachmentPreviewBar = document.getElementById("attachmentPreviewBar");
+let pendingAttachments = []; // [{type:'image'|'video', url, name, size}]
+const groupMsgIndex = new Map();
 let stompClient = null;
 let username = null;
 let currentChat = null; // {type: 'public'|'private'|'group', id, name}
 
 /** Biệt danh theo thành viên cho phòng hiện tại: Map<userId, nickname> */
 let memberNickMap = new Map();
+
 
 /* ========================================================
    THEME (HỢP NHẤT)
@@ -87,7 +88,7 @@ function simpleHash(str) {
    WEBSOCKET + STOMP
 ======================================================== */
 let isConnected = false;
-let subs = {}; // lưu các subscription để tránh đăng ký trùng
+let subs = {};
 function connect(event) {
   // Nếu đã kết nối thì thôi
   if (isConnected && stompClient?.connected) {
@@ -109,10 +110,9 @@ function connect(event) {
 
 
 function onConnected() {
-  console.log('✅ Connected to WebSocket');
+  console.log('✅ đã kết nối');
   isConnected = true;
 
-  // Hủy subs cũ (nếu có) để không bị đăng ký chồng
   Object.values(subs).forEach(s => s?.unsubscribe?.());
   subs = {};
   stompClient.subscribe('/topic/public', onPublicMessageReceived);
@@ -120,20 +120,19 @@ function onConnected() {
   // stompClient.subscribe(`/user/${username}/private`, onPrivateMessageReceived);
   // stompClient.subscribe(`/user/${username}/friend-request`, onFriendRequestReceived);
   // stompClient.subscribe(`/user/${username}/group`, onGroupMessageReceived);
-   stompClient.subscribe('/user/queue/private',        onPrivateMessageReceived);
-   stompClient.subscribe('/user/queue/friend-request', onFriendRequestReceived);
-   stompClient.subscribe('/user/queue/group',          onGroupMessageReceived);
+  stompClient.subscribe('/user/queue/private',        onPrivateMessageReceived);
+  stompClient.subscribe('/user/queue/friend-request', onFriendRequestReceived);
+  stompClient.subscribe('/user/queue/group',          onGroupMessageReceived);
   loadInitialData();
   loadPendingFriendRequests();
   stompClient.send('/app/chat.join', {}, JSON.stringify({ sender: username, type: 'JOIN' }));
   refreshSidebar();
   switchToPublicChat();
-  loadProfileFromDatabase();
 }
 
 function onError(error) {
   console.error('❌ WebSocket connection error:', error);
-  showErrorMessage('Lỗi kết nối WebSocket. Vui lòng tải lại trang.');
+  showErrorMessage('Lỗi kết nối. Vui lòng tải lại trang.');
 }
 
 /* ========================================================
@@ -154,14 +153,45 @@ function onPrivateMessageReceived(payload) {
   }
   updateChatListWithNewMessage();
 }
+// Sửa handler group:
 function onGroupMessageReceived(payload) {
   const message = JSON.parse(payload.body);
+
+  // chỉ render nếu đang mở đúng group
   const msgGroupId = message.groupId ?? message.chatId ?? message.group?.id;
-  if (currentChat?.type === 'group' && currentChat?.id == msgGroupId) {
-    try { displayGroupMessage(message, true); } catch (e) { console.error(e); }
+  if (!(currentChat?.type === 'group' && currentChat?.id == msgGroupId)) {
+    updateChatListWithNewMessage();
+    return;
   }
-  updateChatListWithNewMessage();
+
+  const hasAtt = Array.isArray(message.attachments) && message.attachments.length > 0;
+  const mid = message.id || null;
+
+  if (mid) {
+    const prev = groupMsgIndex.get(mid);
+    if (prev) {
+      // đã render trước đó
+      if (prev.hasAtt || !hasAtt) {
+        // 1) đã có bản tốt (có file) rồi → bỏ qua bản kém
+        // 2) cả hai đều kém (không file) → bỏ qua trùng
+        return;
+      }
+      // trước đó không có file, giờ có file → UPGRADE
+      updateGroupMessageBubble(message);
+      groupMsgIndex.set(mid, { hasAtt: true });
+      return;
+    } else {
+      // lần đầu thấy id này → render mới
+      displayGroupMessage(message, true);
+      groupMsgIndex.set(mid, { hasAtt });
+      return;
+    }
+  }
+
+  displayGroupMessage(message, true);
 }
+
+
 
 function onFriendRequestReceived(payload) {
   const notification = JSON.parse(payload.body);
@@ -258,20 +288,14 @@ function createFriendItem(friend) {
   const displayName = (friend.fullName && friend.fullName.trim()) ? friend.fullName : friend.username;
   const initials = getInitials(displayName);
   const gradient = pickGradient(simpleHash(friend.username||''));
-  const url = extractAvatarUrl(friend) || (friend.username && avatarCache.get(friend.username)) || null;
-
   const w = document.createElement('div');
   w.className = "chat-item p-3 rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer transition-colors";
   w.onclick = () => switchToPrivateChat(friend);
-
-  // 👉 thêm data-username để tìm lại node khi cần
-  w.setAttribute('data-username', friend.username || '');
-
   w.innerHTML = `
     <div class="flex items-center space-x-3">
-      <!-- 👉 holder để thay avatar in-place -->
-      <div class="relative" data-avatar-for="${friend.username || ''}">
-        ${renderAvatar(url, initials, gradient, 10)}
+      <div class="relative">
+        <div class="w-10 h-10 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center"><span class="text-white text-sm font-medium">${initials}</span></div>
+        <div class="absolute -bottom-1 -right-1 w-3 h-3 ${friend.status==='ONLINE'?'bg-green-500':'bg-gray-400'} rounded-full border-2 border-white dark:border-gray-900"></div>
       </div>
       <div class="flex-1 min-w-0">
         <h4 class="chat-name font-medium text-gray-900 dark:text-white truncate text-sm">${displayName}</h4>
@@ -280,17 +304,6 @@ function createFriendItem(friend) {
     </div>`;
   return w;
 }
-
-function patchSidebarAvatar(username, url, displayName) {
-  const esc = window.CSS?.escape ? CSS.escape(username) : String(username).replace(/"/g, '\\"');
-  const holder = document.querySelector(`[data-avatar-for="${esc}"]`);
-  if (!holder) return;
-  const initials = getInitials(displayName || username);
-  const gradient = pickGradient(simpleHash(username || ''));
-  holder.innerHTML = renderAvatar(url, initials, gradient, 10);
-}
-
-
 function createGroupItem(group) {
   const initials = getInitials(group.name);
   const gradient = pickGradient(simpleHash(group.name||''));
@@ -406,68 +419,224 @@ function switchToGroupChat(group) {
     loadGroupChatHistory(group.id);
   });
 }
+async function uploadOneFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+
+  const headers = {};
+  if (csrfHeader && csrfToken) headers[csrfHeader] = csrfToken;
+
+  try {
+    const res = await fetch('/api/upload', { method: 'POST', body: fd, headers });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    const mime = (file.type || '').toLowerCase();
+    const t = data.type || (mime.startsWith('image/') ? 'image'
+        : mime.startsWith('video/') ? 'video' : 'file');
+    return { type: t, url: data.url, name: data.name || file.name, size: data.size || file.size };
+  } catch (e) {
+    console.error('Upload failed:', e);
+    // tuỳ bạn, có thể hiện toast lỗi
+    return null;
+  }
+}
+
+function addAttachmentPreview(att) {
+  if (!attachmentPreviewBar) return;
+  const box = document.createElement('div');
+  box.className = 'relative w-20 h-20 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-600';
+
+  const delBtn = document.createElement('button');
+  delBtn.className = 'absolute -top-2 -right-2 w-6 h-6 rounded-full bg-red-500 text-white text-xs';
+  delBtn.textContent = '✕';
+  delBtn.onclick = () => {
+    pendingAttachments = pendingAttachments.filter(a => a !== att);
+    box.remove();
+  };
+
+  if (att.type === 'image') {
+    const img = document.createElement('img');
+    img.src = att.url; img.alt = att.name || 'image';
+    img.className = 'w-full h-full object-cover';
+    box.appendChild(img);
+  } else if (att.type === 'video') {
+    const v = document.createElement('video');
+    v.src = att.url; v.muted = true; v.loop = true; v.autoplay = true; v.controls = false;
+    v.className = 'w-full h-full object-cover';
+    box.appendChild(v);
+  } else {
+    const span = document.createElement('span');
+    span.className = 'text-xs p-2 block';
+    span.textContent = att.name || 'Tệp đính kèm';
+    box.appendChild(span);
+  }
+
+  box.appendChild(delBtn);
+  attachmentPreviewBar.appendChild(box);
+}
+
+function clearAttachmentPreview() {
+  pendingAttachments = [];
+  if (attachmentPreviewBar) attachmentPreviewBar.innerHTML = '';
+}
+
+function renderAttachmentsHtml(atts) {
+  let arr = atts;
+  if (typeof arr === 'string') {
+    try { arr = JSON.parse(arr); } catch { arr = []; }
+  }
+  if (!Array.isArray(arr)) arr = arr ? [arr] : [];
+  if (arr.length === 0) return '';
+  const inferType = (url='') => {
+    const u = String(url).toLowerCase();
+    if (/\.(png|jpg|jpeg|gif|webp|bmp|svg)$/.test(u)) return 'image';
+    if (/\.(mp4|webm|ogg|mov|m4v)$/.test(u))          return 'video';
+    return 'file';
+  };
+  const items = arr.map(a => {
+    const url  = a?.url || '';
+    const name = a?.name || (url ? url.split('/').pop() : 'Tệp đính kèm');
+    const type = (a?.type || '').toLowerCase() || inferType(url);
+
+    if (!url) return '';
+
+    if (type === 'image') {
+      return `<img src="${url}" alt="${name}" class="mt-2 rounded-lg max-h-64 object-contain">`;
+    }
+    if (type === 'video') {
+      return `<video src="${url}" class="mt-2 rounded-lg max-h-64" controls playsinline></video>`;
+    }
+    return `<a href="${url}" download class="mt-2 inline-block text-lightgreen underline" rel="noopener">${name}</a>`;
+  }).join('');
+
+  return items ? `<div class="attachments">${items}</div>` : '';
+}
 
 /* ========================================================
    SEND MESSAGE
 ======================================================== */
 function sendMessage(evt) {
   const content = messageInput?.value.trim();
-  if (!content || !stompClient || messageInput.disabled) return;
-  if (currentChat?.type === 'public') sendPublicMessage(content);
-  else if (currentChat?.type === 'private') sendPrivateMessage(content);
-  else if (currentChat?.type === 'group') sendGroupMessage(content);
+  const hasFiles = pendingAttachments.length > 0;
+
+  if ((!content && !hasFiles) || !stompClient || messageInput.disabled) return;
+
+  if (currentChat?.type === 'public')      sendPublicMessage(content, pendingAttachments);
+  else if (currentChat?.type === 'private')sendPrivateMessage(content, pendingAttachments);
+  else if (currentChat?.type === 'group')  sendGroupMessage(content, pendingAttachments);
+
   messageInput.value = '';
+  clearAttachmentPreview();
   evt?.preventDefault();
 }
-function sendPublicMessage(content) {
-  const msg = { sender: username, content, type: 'CHAT', timestamp: new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'}) };
+
+function sendPublicMessage(content, attachments = []) {
+  const msg = {
+    sender: username,
+    content: content || '',
+    attachments,               // 👈
+    type: 'CHAT',
+    timestamp: new Date().toISOString()
+  };
   stompClient.send('/app/chat.send', {}, JSON.stringify(msg));
 }
-async function sendPrivateMessage(content) {
+
+async function sendPrivateMessage(content, attachments = []) {
   try {
     const res = await fetch(`/api/private-chat/${currentChat.id}/send`, {
       method:'POST',
       headers:{ 'Content-Type':'application/json', ...(csrfHeader && csrfToken ? { [csrfHeader]: csrfToken } : {}) },
-      body: JSON.stringify({ content })
+      body: JSON.stringify({ content: content || '', attachments }) // 👈
     });
-    // Không display ở đây; chờ onPrivateMessageReceived đẩy về để hiển thị
     if (!res.ok) console.error('Send private failed:', await res.text());
   } catch (e) { console.error('Error sending private message:', e); }
 }
 
-async function sendGroupMessage(content) {
+
+async function sendGroupMessage(content, attachments = []) {
   try {
     const res = await fetch(`/api/groups/${currentChat.id}/send`, {
       method:'POST',
       headers:{ 'Content-Type':'application/json', ...(csrfHeader && csrfToken ? { [csrfHeader]: csrfToken } : {}) },
-      body: JSON.stringify({ content })
+      body: JSON.stringify({ content: content || '', attachments }) // 👈
     });
-    // Không display ở đây; chờ onGroupMessageReceived
     if (!res.ok) console.error('Send group failed:', await res.text());
   } catch (e) { console.error('Error sending group message:', e); }
 }
 
+
 /* ========================================================
    MESSAGE DISPLAY (ƯU TIÊN BIỆT DANH)
 ======================================================== */
+function buildGroupBubble(message) {
+  const div = document.createElement('div');
+  div.className = 'flex items-start space-x-3 message-bubble';
+
+  const s = normalizeSender(message);
+  const isMe = s.username === username;
+
+  const displayName = resolveDisplayNameFromMap(s);
+  const initials = getInitials(displayName);
+  const gradient = pickGradient(simpleHash(s.username || String(s.id || '')));
+  const t = message.timestamp ? new Date(message.timestamp) : null;
+  const time = (t && !isNaN(t)) ? t.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})
+      : new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
+  const hasAtt = Array.isArray(message.attachments) && message.attachments.length > 0;
+
+  if (isMe) {
+    div.classList.add('justify-end');
+    div.innerHTML = `
+      <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+        ${ hasAtt ? '' : `<p class="text-white">${message.content || ''}</p>` }
+        ${renderAttachmentsHtml(message.attachments)}
+        <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
+      </div>
+      <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>`;
+  } else {
+    div.classList.add('items-start');
+    div.innerHTML = `
+      <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>
+      <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+        <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayName}</div>
+        ${ hasAtt ? '' : `<p class="text-gray-800 dark:text-gray-200">${message.content || ''}</p>` }
+        ${renderAttachmentsHtml(message.attachments)}
+        <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
+      </div>`;
+  }
+  return div;
+}
+
+function looksLikeFileUrl(s) {
+  return /^https?:\/\/|^\/uploads\//i.test((s || '').trim());
+}
+function escapeHtml(s){
+  return (s||'').replace(/[&<>"']/g, m => (
+      {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]
+  ));
+}
+function renderTextHtml(raw, className) {
+  const t = (raw || '').trim();
+  if (!t || looksLikeFileUrl(t)) return '';
+  return `<p class="${className}">${escapeHtml(t)}</p>`;
+}
+
 function displayMessage(message, autoScroll = true) {
   const div = document.createElement('div');
   div.className = 'flex items-start space-x-3 message-bubble';
   const isMe = message.sender === username;
-
   const displayNameBase =
       message.nickname
       || message.fullName || message.full_name
       || message.senderFullName || message.sender_name
       || message.senderUsername || message.sender
       || 'Ẩn danh';
-
-  // avatar
   const initials = getInitials(displayNameBase);
   const gradient = pickGradient(simpleHash(message.sender||''));
-  const avatarUrl = extractAvatarUrl(message) || (message.senderUsername && avatarCache.get(message.senderUsername)) || null;
-
   const time = message.timestamp || new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
+  const hasAtt = Array.isArray(message.attachments) && message.attachments.length > 0;
+  const rawText = (message.content || '').trim();
+  const meTextHtml = renderTextHtml(rawText, 'text-white');
+  const otherTextHtml = renderTextHtml(rawText, 'text-gray-800 dark:text-gray-200');
 
   if (message.type === 'JOIN') {
     div.className = 'flex justify-center my-4';
@@ -478,26 +647,28 @@ function displayMessage(message, autoScroll = true) {
   } else if (isMe) {
     div.classList.add('justify-end');
     div.innerHTML = `
-      <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md">
-        <p class="text-white">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
-      </div>
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-    `;
+  <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+   ${meTextHtml}
+    ${renderAttachmentsHtml(message.attachments)}
+    <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
+  </div>
+  <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>`;
+
   } else {
     div.classList.add('items-start');
     div.innerHTML = `
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-      <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md">
-        <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayNameBase}</div>
-        <p class="text-gray-800 dark:text-gray-200">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
-      </div>`;
+  <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>
+  <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+    <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayNameBase}</div>
+    ${otherTextHtml}
+    ${renderAttachmentsHtml(message.attachments)}
+    <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
+  </div>`;
+
   }
   chatMessages?.appendChild(div);
   if (autoScroll) scrollToBottom();
 }
-
 function normalizeSender(message) {
   const s = message.sender || {};
   return {
@@ -511,13 +682,9 @@ function normalizeSender(message) {
         s.fullName ?? s.full_name ??
         message.senderFullName ?? message.sender_name ??
         message.fullName ?? message.name ?? null,
-    nickname: s.nickname ?? message.nickname ?? null,
-    avatarUrl:
-        s.avatarUrl ?? s.avatar_url ??
-        message.avatarUrl ?? message.avatar_url ?? null
+    nickname: s.nickname ?? message.nickname ?? null
   };
 }
-
 
 function resolveDisplayNameFromMap(senderLike) {
   if (!senderLike) return 'Ẩn danh';
@@ -545,75 +712,54 @@ function displayPrivateMessage(message, autoScroll = true) {
   const displayName = resolveDisplayNameFromMap(s);
   const initials = getInitials(displayName);
   const gradient = pickGradient(simpleHash(s.username || String(s.id || '')));
-  const avatarUrl = s.avatarUrl || (s.username && avatarCache.get(s.username)) || null;
-
   const t = message.timestamp ? new Date(message.timestamp) : null;
   const time = (t && !isNaN(t)) ? t.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})
       : new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
+  // ... phần innerHTML giữ nguyên như bạn đang có, chỉ thay biến dùng ở trên ...
+  const rawText = (message.content || '').trim();
+  const meTextHtml = renderTextHtml(rawText, 'text-white');
+  const otherTextHtml = renderTextHtml(rawText, 'text-gray-800 dark:text-gray-200');
 
   if (isMe) {
     div.classList.add('justify-end');
     div.innerHTML = `
-      <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md">
-        <p class="text-white">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
-      </div>
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-    `;
+  <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+    ${meTextHtml}
+    ${renderAttachmentsHtml(message.attachments)}
+    <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
+  </div>
+  <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>`;
+
   } else {
     div.classList.add('items-start');
     div.innerHTML = `
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-      <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md">
-        <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayName}</div>
-        <p class="text-gray-800 dark:text-gray-200">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
-      </div>
-    `;
+  <div class="w-8 h-8 bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0"><span class="text-white text-sm font-bold">${initials}</span></div>
+  <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md break-words">
+    <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayName}</div>
+    ${otherTextHtml}
+    ${renderAttachmentsHtml(message.attachments)}
+    <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
+  </div>`;
   }
   chatMessages?.appendChild(div);
   if (autoScroll) scrollToBottom();
 }
 
 function displayGroupMessage(message, autoScroll = true) {
-  const div = document.createElement('div');
-  div.className = 'flex items-start space-x-3 message-bubble';
-
-  const s = normalizeSender(message);
-  const isMe = s.username === username;
-
-  const displayName = resolveDisplayNameFromMap(s);
-  const initials = getInitials(displayName);
-  const gradient = pickGradient(simpleHash(s.username || String(s.id || '')));
-  const avatarUrl = s.avatarUrl || (s.username && avatarCache.get(s.username)) || null;
-
-  const t = message.timestamp ? new Date(message.timestamp) : null;
-  const time = (t && !isNaN(t)) ? t.toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'})
-      : new Date().toLocaleTimeString('vi-VN',{hour:'2-digit',minute:'2-digit'});
-
-  if (isMe) {
-    div.classList.add('justify-end');
-    div.innerHTML = `
-      <div class="bg-gradient-to-r from-purple-500 to-purple-700 rounded-2xl rounded-tr-md px-4 py-3 max-w-xs lg:max-w-md break-words">
-        <p class="text-white">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-purple-100">${time}</span></div>
-      </div>
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-    `;
-  } else {
-    div.classList.add('items-start');
-    div.innerHTML = `
-      ${renderAvatar(avatarUrl, initials, gradient, 8)}
-      <div class="bg-gray-100 dark:bg-gray-700 rounded-2xl rounded-tl-md px-4 py-3 max-w-xs lg:max-w-md break-words">
-        <div class="text-xs text-gray-500 dark:text-gray-400 mb-1 font-medium">${displayName}</div>
-        <p class="text-gray-800 dark:text-gray-200">${message.content}</p>
-        <div class="flex items-center justify-end mt-1"><span class="text-xs text-gray-500 dark:text-gray-400">${time}</span></div>
-      </div>
-    `;
-  }
+  const div = buildGroupBubble(message);
+  if (message.id) div.setAttribute('data-mid', String(message.id)); // để còn update
   chatMessages?.appendChild(div);
   if (autoScroll) scrollToBottom();
 }
+function updateGroupMessageBubble(message) {
+  if (!message.id) return displayGroupMessage(message, false);
+  const div = chatMessages?.querySelector(`.message-bubble[data-mid="${message.id}"]`);
+  if (!div) return displayGroupMessage(message, false);
+
+  const fresh = buildGroupBubble(message);
+  div.innerHTML = fresh.innerHTML; // thay nội dung (giữ nguyên vị trí)
+}
+
 
 /* ========================================================
    FRIEND SYSTEM
@@ -949,8 +1095,9 @@ document.addEventListener('click', (e)=>{ if (!emojiPicker || !emojiToggleBtn) r
 window.addEventListener('keydown',(e)=>{ if (e.key==='Escape') closeEmojiPicker(); });
 renderEmojiGrid('recent');
 
-// --- Profile / Avatar localStorage ---
-
+/* ========================================================
+   PROFILE / AVATAR (localStorage)
+======================================================== */
 const profileNameEl    = $("#profileName");
 const profileStatusEl  = $("#profileStatus");
 const editProfileBtn   = $("#editProfileBtn");
@@ -974,289 +1121,40 @@ const editAvatarFallback    = $("#editAvatarFallback");
 const editAvatarBtn         = $("#editAvatarBtn");
 const editAvatarFile        = $("#editAvatarFile");
 const removeAvatarBtn       = $("#removeAvatarBtn");
-
-editAvatarBtn?.addEventListener('click', () => {
-  // reset để chọn lại cùng 1 file vẫn nhận change
-  if (editAvatarFile) editAvatarFile.value = '';
-  editAvatarFile?.click();
-});
-
-removeAvatarBtn?.addEventListener('click', async () => {
-  try {
-    const res = await fetch('/api/users/avatar', {
-      method: 'DELETE',
-      headers: { ...(csrfHeader && csrfToken ? { [csrfHeader]: csrfToken } : {}) }
-    });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-
-    const url = data?.url || DEFAULT_AVATAR_URL;
-    localStorage.setItem('profileAvatarServerUrl', url);
-    applyAvatar(url);
-
-    showSuccessMessage('Đã xóa ảnh đại diện.');
-  } catch (e) {
-    console.error(e);
-    showErrorMessage('Không xóa được ảnh.');
-  }
-});
-
-// 👉 Lắng nghe chọn file, đọc thành dataURL và preview + lưu
-editAvatarFile?.addEventListener('change', async (e) => {
-  const f = e.target.files?.[0];
-  if (!f) return;
-
-  const MAX_BYTES = 2 * 1024 * 1024; // 2MB
-  if (f.size > MAX_BYTES) {
-    showErrorMessage('Ảnh quá lớn (> 2MB). Vui lòng chọn ảnh nhỏ hơn.');
-    e.target.value = '';
-    return;
-  }
-  if (!/^image\/(png|jpe?g|gif|webp|bmp|svg\+xml)$/i.test(f.type)) {
-    showErrorMessage('Định dạng ảnh không hợp lệ.');
-    e.target.value = '';
-    return;
-  }
-
-  try {
-    // Upload multipart/form-data
-    const fd = new FormData();
-    fd.append('file', f);
-
-    const res = await fetch('/api/users/avatar', {
-      method: 'POST',
-      headers: { ...(csrfHeader && csrfToken ? { [csrfHeader]: csrfToken } : {}) },
-      body: fd
-    });
-
-    if (!res.ok) {
-      const msg = await res.text();
-      showErrorMessage(msg || 'Upload ảnh thất bại.');
-      return;
-    }
-
-    const { url } = await res.json();
-    if (!url) {
-      showErrorMessage('Server không trả về URL ảnh.');
-      return;
-    }
-
-    // Lưu URL server để dùng khi “Lưu hồ sơ”
-    localStorage.setItem('profileAvatarServerUrl', url);
-
-    // Preview luôn bằng URL server
-    applyAvatar(url);
-    showSuccessMessage('Đã tải ảnh lên.');
-  } catch (err) {
-    console.error(err);
-    showErrorMessage('Không upload được ảnh.');
-  }
-});
-
-
-
-function applyAvatar(url) {
-  const finalUrl = (url && url.trim() !== '') ? url : DEFAULT_AVATAR_URL;
-
-  if (profileAvatarImg && profileAvatarFallback) {
-    profileAvatarImg.src = finalUrl;
-    profileAvatarImg.style.display = 'block';
-    profileAvatarFallback.style.display = 'none';
-  }
-
-  if (editAvatarPreview && editAvatarFallback) {
-    editAvatarPreview.src = finalUrl;
-    editAvatarPreview.style.display = 'block';
-    editAvatarFallback.style.display = 'none';
-  }
-}
-
-// (A) Khởi tạo từ localStorage
-(function initAvatarFromStorage(){
-  const saved =
-      localStorage.getItem('profileAvatarServerUrl')  // ưu tiên URL từ server
-      || localStorage.getItem('profileAvatar')        // (cũ) nếu còn giữ dataURL
-      || '';
-  applyAvatar(saved || null);
-})();
-
-// (B) Khi mở modal chỉnh sửa
-editProfileBtn?.addEventListener('click', ()=> {
-  const currentName = localStorage.getItem('profileName') || (profileNameEl?.textContent?.trim() || 'Bạn');
-  const currentKey  = localStorage.getItem('profileStatusKey') || labelToKey(profileStatusEl?.textContent?.trim() || '');
-  if (editNameInput)    editNameInput.value = currentName;
-  if (editStatusSelect) editStatusSelect.value = STATUS_KEYS.includes(currentKey) ? currentKey : 'active';
-
-  // Avatar preview
-  const storedAvatar = localStorage.getItem('profileAvatarServerUrl') || localStorage.getItem('profileAvatar');
-  applyAvatar(storedAvatar || null);
-
-  // 👇 Prefill email/phone từ profile đang có
-  const p = currentProfile || {};
-  if (editMailInput)  editMailInput.value  = p.email ?? '';
-  if (editPhoneInput) editPhoneInput.value = p.phone ?? '';
-
-  document.getElementById('editProfileModal')?.classList.remove('hidden');
-});
-
-
-
-document.getElementById('saveProfileChanges')?.addEventListener('click', async () => {
-  const newName  = (editNameInput?.value || 'Bạn').trim();
-  const key      = editStatusSelect?.value || 'active';
-  const safeKey  = STATUS_KEYS.includes(key) ? key : 'active';
-  const newEmail = (editMailInput?.value  || '').trim();
-  const newPhone = (editPhoneInput?.value || '').trim();
-
-  const payload = {
-    fullName: newName,
-    status:   safeKey,
-    email:    newEmail || null,   // rỗng => xóa ở server
-    phone:    newPhone || null    // rỗng => xóa ở server
-  };
-
-  const avatarUrlFromLS = localStorage.getItem('profileAvatarServerUrl');
-  if (avatarUrlFromLS && avatarUrlFromLS.trim() !== '') {
-    payload.avatarUrl = avatarUrlFromLS;
-  }
-
-  try {
-    const response = await fetch('/api/users/profile', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', [csrfHeader]: csrfToken },
-      body: JSON.stringify(payload)
-    });
-
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok || data?.success === false) {
-      const msg = data?.message || data?.error || 'Lỗi không xác định';
-      showErrorMessage('Không thể cập nhật hồ sơ: ' + msg);
-      return;
-    }
-
-    // Đồng bộ lại UI từ server (tránh sai khác sau khi chuẩn hóa email/phone)
-    const u = data?.user || {};
-    if (profileNameEl) profileNameEl.textContent = u.fullName || newName;
-    updateStatusUI(safeKey);
-    if (typeof u.avatarUrl === 'string' && u.avatarUrl.trim() !== '') {
-      localStorage.setItem('profileAvatarServerUrl', u.avatarUrl);
-      applyAvatar(u.avatarUrl);
-    }
-    // cập nhật lại các input trong modal (đã lưu/chuẩn hoá)
-    if (editMailInput)  editMailInput.value  = u.email ?? '';
-    if (editPhoneInput) editPhoneInput.value = u.phone ?? '';
-
-    if (editPersistChk?.checked) {
-      localStorage.setItem('profileName', profileNameEl?.textContent || newName);
-      localStorage.setItem('profileStatusKey', safeKey);
-      localStorage.setItem('profileStatus', STATUS_MAP[safeKey].label);
-    } else {
-      localStorage.removeItem('profileName');
-      localStorage.removeItem('profileStatusKey');
-      localStorage.removeItem('profileStatus');
-    }
-
-    showSuccessMessage('Cập nhật hồ sơ thành công!');
-  } catch (error) {
-    console.error('Error updating profile:', error);
-    showErrorMessage('Lỗi kết nối: Không thể cập nhật hồ sơ');
-  }
-
-  document.getElementById('editProfileModal')?.classList.add('hidden');
-});
-
-// === Load profile từ Database (GET /api/users/profile)
-// === Load profile từ Database (GET /api/users/profile)
-async function loadProfileFromDatabase() {
-  try {
-    const response = await fetch('/api/users/profile', {
-      method: 'GET',
-      headers: { ...(csrfHeader && csrfToken ? { [csrfHeader]: csrfToken } : {}) }
-    });
-    if (!response.ok) return;
-
-    const profile = await response.json();
-    currentProfile = profile; // 👈 lưu lại
-
-    // Tên hiển thị
-    if (profileNameEl && profile.fullName) {
-      profileNameEl.textContent = profile.fullName;
-      if (!localStorage.getItem('profileName')) {
-        localStorage.setItem('profileName', profile.fullName);
-      }
-    }
-
-    // Trạng thái
-    if (profile.status) {
-      updateStatusUI(profile.status);
-      if (!localStorage.getItem('profileStatusKey')) {
-        localStorage.setItem('profileStatusKey', profile.status);
-        localStorage.setItem('profileStatus', STATUS_MAP[profile.status]?.label || 'Đang hoạt động');
-      }
-    }
-
-    // Avatar
-    const finalAvatarUrl =
-        (profile.avatarUrl && profile.avatarUrl.trim() !== '')
-            ? profile.avatarUrl
-            : DEFAULT_AVATAR_URL;
-
-    localStorage.setItem('profileAvatarServerUrl', finalAvatarUrl);
-    applyAvatar(finalAvatarUrl);
-
-    if (profile.username) {
-      avatarCache.set(profile.username, finalAvatarUrl);
-    }
-
-    // 👇 NẠP SẴN email/phone vào các ô trong modal
-    if (editMailInput)  editMailInput.value  = profile.email  ?? '';
-    if (editPhoneInput) editPhoneInput.value = profile.phone  ?? '';
-
-  } catch (error) {
-    console.error('Error loading profile from database:', error);
-  }
-}
-
-
-
-/* =========================== AVATAR HELPERS =========================== */
-
-
-function extractAvatarUrl(obj) {
-  // thử lấy từ nhiều field khác nhau
-  return obj?.avatarUrl || obj?.avatar_url ||
-      obj?.sender?.avatarUrl || obj?.sender?.avatar_url || null;
-}
-
-/** Trả về HTML ảnh + fallback (ẩn) — onerror sẽ hiện fallback */
-function renderAvatar(avatarUrl, initials, gradient, sizeTailwind = 10) {
-  const sizeClass = `w-${sizeTailwind} h-${sizeTailwind}`;
-  const img = avatarUrl ? `
-    <img src="${avatarUrl}"
-         alt="${initials}"
-         class="${sizeClass} rounded-full object-cover flex-shrink-0"
-         onerror="this.style.display='none'; this.nextElementSibling?.classList.remove('hidden');">`
-      : '';
-
-  const fallback = `
-    <div class="${sizeClass} bg-gradient-to-r ${gradient} rounded-full flex items-center justify-center flex-shrink-0 ${avatarUrl ? 'hidden' : ''}">
-      <span class="text-white text-sm font-bold">${initials}</span>
-    </div>`;
-
-  return img + fallback;
-}
+function applyAvatar(dataUrl){ if (profileAvatarImg && profileAvatarFallback){ if (dataUrl){ profileAvatarImg.src=dataUrl; profileAvatarImg.style.display='block'; profileAvatarImg.classList.add('w-12','h-12'); profileAvatarFallback.style.display='none'; } else { profileAvatarImg.removeAttribute('src'); profileAvatarImg.style.display='none'; profileAvatarFallback.style.display='flex'; } } if (editAvatarPreview && editAvatarFallback){ if (dataUrl){ editAvatarPreview.src=dataUrl; editAvatarPreview.style.display='block'; editAvatarFallback.style.display='none'; } else { editAvatarPreview.removeAttribute('src'); editAvatarPreview.style.display='none'; editAvatarFallback.style.display='flex'; } } }
+function fileToDataURL(file){ return new Promise((resolve,reject)=>{ const reader=new FileReader(); reader.onload=()=>resolve(reader.result); reader.onerror=reject; reader.readAsDataURL(file); }); }
+(function initAvatarFromStorage(){ const saved=localStorage.getItem('profileAvatar')||''; applyAvatar(saved||null); })();
+editProfileBtn?.addEventListener('click', ()=>{ const currentName=localStorage.getItem('profileName')||(profileNameEl?.textContent?.trim()||'Bạn'); const currentKey=localStorage.getItem('profileStatusKey')||labelToKey(profileStatusEl?.textContent?.trim()||''); if (editNameInput) editNameInput.value=currentName; if (editStatusSelect) editStatusSelect.value=STATUS_KEYS.includes(currentKey)?currentKey:'active'; applyAvatar(localStorage.getItem('profileAvatar')||null); if (editPersistChk){ editPersistChk.checked = Boolean(localStorage.getItem('profileName')||localStorage.getItem('profileStatusKey')||localStorage.getItem('profileStatus')); }
+  const modal = document.getElementById('editProfileModal'); modal?.classList.remove('hidden'); });
+$("#saveProfileChanges")?.addEventListener('click', ()=>{ const newName=(editNameInput?.value.trim()||'Bạn'); const key=editStatusSelect?.value||'active'; const safeKey=STATUS_KEYS.includes(key)?key:'active'; if (profileNameEl) profileNameEl.textContent=newName; updateStatusUI(safeKey); if (editPersistChk?.checked){ localStorage.setItem('profileName', newName); localStorage.setItem('profileStatusKey', safeKey); localStorage.setItem('profileStatus', STATUS_MAP[safeKey].label); } else { localStorage.removeItem('profileName'); localStorage.removeItem('profileStatusKey'); localStorage.removeItem('profileStatus'); } document.getElementById('editProfileModal')?.classList.add('hidden'); });
+editAvatarBtn?.addEventListener('click', ()=> editAvatarFile?.click());
+editAvatarFile?.addEventListener('change', async (e)=>{ const f=e.target.files?.[0]; if (!f) return; if (f.size > 2*1200*1080){ alert('Ảnh quá lớn. Vui lòng chọn ảnh nhỏ hơn.'); editAvatarFile.value=''; return; } try{ const dataUrl=await fileToDataURL(f); localStorage.setItem('profileAvatar', dataUrl); applyAvatar(dataUrl); } catch(err){ console.error(err); alert('Không đọc được file ảnh.'); } });
+removeAvatarBtn?.addEventListener('click', ()=>{ localStorage.removeItem('profileAvatar'); if (editAvatarFile) editAvatarFile.value=''; applyAvatar(null); });
 
 /* ========================================================
    DOM READY
 ======================================================== */
 document.addEventListener('DOMContentLoaded', function(){
   const usernameInput = $('#username');
+  attachBtn?.addEventListener('click', () => attachInput?.click());
   if (usernameInput && usernameInput.value) {
     username = usernameInput.value.trim();
     console.log('🔄 Auto-connecting WebSocket for user:', username);
     connect();
-    loadProfileFromDatabase();
   }
+  // them anh và vi déo
+  attachInput?.addEventListener('change', async (e) => {
+    if (!e.target.files?.length) return;
+    const files = Array.from(e.target.files);
+    for (const f of files) {
+      const uploaded = await uploadOneFile(f);
+      if (uploaded) {
+        pendingAttachments.push(uploaded);
+        addAttachmentPreview(uploaded);
+      }
+    }
+    attachInput.value = '';
+  });
 
   $('#connectForm')?.addEventListener('submit', connect);
   sendButton?.addEventListener('click', sendMessage);
@@ -1264,6 +1162,7 @@ document.addEventListener('DOMContentLoaded', function(){
 
   // Bạn đã có showAddFriendDialog/showCreateGroupDialog ở nơi khác
   $('#addFriendBtn')?.addEventListener('click', showAddFriendDialog);
+  $('#createGroupBtn')?.addEventListener('click', showCreateGroupDialog);
 
   const basicSearchInput = (!document.getElementById("chatSearchInput"))
       ? document.querySelector('input[placeholder="Tìm kiếm cuộc trò chuyện..."]')
@@ -1626,42 +1525,4 @@ function renderSidebar(friends = [], groups = []) {
     const name = it.querySelector('h3, .chat-name, h4')?.textContent.toLowerCase() || '';
     it.style.display = name.includes(kw) ? '' : 'none';
   });
-  enrichAvatarsFromAPI(friends);
 }
-
-async function enrichAvatarsFromAPI(friends = []) {
-  // Những bạn thiếu avatarUrl
-  const need = friends.filter(f => f.username && !extractAvatarUrl(f) && !avatarCache.get(f.username));
-  if (need.length === 0) return;
-
-  const updated = []; // usernames đã cập nhật
-  await Promise.allSettled(
-      need.map(async (f) => {
-        try {
-          const res = await fetch(`/api/users/by-username/${encodeURIComponent(f.username)}`, {
-            headers: csrfHeader ? { [csrfHeader]: csrfToken } : {}
-          });
-          if (!res.ok) return;
-          const u = await res.json();
-
-          const url = u?.avatarUrl || u?.avatar_url || '';
-          if (u?.username && url) {
-            avatarCache.set(u.username, url);
-            updated.push(u.username);
-
-            // Patch ngay ở sidebar (nếu node đang hiển thị)
-            patchSidebarAvatar(u.username, url, u.fullName || u.username);
-          }
-        } catch { /* noop */ }
-      })
-  );
-
-  // 👉 Chỉ refresh 1 lần nếu có cập nhật (phòng trường hợp DOM chưa có holder để patch)
-  if (updated.length) {
-    scheduleSidebarRefresh();
-  }
-}
-
-
-
-
